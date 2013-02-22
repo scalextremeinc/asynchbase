@@ -295,7 +295,6 @@ public final class Scanner {
     this.qualifiers = qualifiers;
   }
 
-
   /**
    * Sets a regular expression to filter results based on the row key.
    * <p>
@@ -312,6 +311,27 @@ public final class Scanner {
   private static final byte[] REGEXSTRINGCOMPARATOR = Bytes.ISO88591("org.apache.hadoop"
     + ".hbase.filter.RegexStringComparator");
   private static final byte[] EQUAL = new byte[] { 'E', 'Q', 'U', 'A', 'L' };
+  
+  private void fillKeyRegexpByteArray(final byte[] array, final byte[] regex, final byte[] chars) {
+    final ChannelBuffer buf = ChannelBuffers.wrappedBuffer(array);
+    buf.clear();  // Set the writerIndex to 0.
+    buf.writeByte((byte) ROWFILTER.length);                     // 1
+    buf.writeBytes(ROWFILTER);                                  // 40
+    // writeUTF of the comparison operator
+    buf.writeShort(5);                                          // 2
+    buf.writeBytes(EQUAL);                                      // 5
+    // The comparator: a RegexStringComparator
+    buf.writeByte(53);  // Code for WritableByteArrayComparable // 1
+    buf.writeByte(0);   // Code for "this has no code".         // 1
+    buf.writeByte((byte) REGEXSTRINGCOMPARATOR.length);         // 1
+    buf.writeBytes(REGEXSTRINGCOMPARATOR);                      // 52
+    // writeUTF the regexp
+    buf.writeShort(regex.length);                               // 2
+    buf.writeBytes(regex);                                      // regex.length
+    // writeUTF the charset
+    buf.writeShort(chars.length);                               // 2
+    buf.writeBytes(chars);                                      // chars.length
+  }
 
   /**
    * Sets a regular expression to filter results based on the row key.
@@ -338,25 +358,82 @@ public final class Scanner {
     final byte[] chars = Bytes.UTF8(charset.name());
     filter = new byte[(1 + 40 + 2 + 5 + 1 + 1 + 1 + 52
                        + 2 + regex.length + 2 + chars.length)];
-    final ChannelBuffer buf = ChannelBuffers.wrappedBuffer(filter);
-    buf.clear();  // Set the writerIndex to 0.
+    fillKeyRegexpByteArray(filter, regex, chars);
+  }
+  
+  public byte[] getKeyRegexp(final String regexp) {
+    return getKeyRegexp(regexp, CharsetUtil.ISO_8859_1);
+  }
+  
+  public byte[] getKeyRegexp(final String regexp, final Charset charset) {
+    final byte[] regex = Bytes.UTF8(regexp);
+    final byte[] chars = Bytes.UTF8(charset.name());
+    byte[] ret = new byte[(1 + 40 + 2 + 5 + 1 + 1 + 1 + 52
+        + 2 + regex.length + 2 + chars.length)];
+    fillKeyRegexpByteArray(ret, regex, chars);
+    return ret;
+  }
+  
+  public void setFilter(final byte[] filter) {
+      this.filter = filter;
+  }
+  
+  private static final byte[] FILTERLIST = Bytes.ISO88591("org.apache.hadoop" +
+    ".hbase.filter.FilterList");
 
-    buf.writeByte((byte) ROWFILTER.length);                     // 1
-    buf.writeBytes(ROWFILTER);                                  // 40
-    // writeUTF of the comparison operator
-    buf.writeShort(5);                                          // 2
-    buf.writeBytes(EQUAL);                                      // 5
-    // The comparator: a RegexStringComparator
-    buf.writeByte(54);  // Code for WritableByteArrayComparable // 1
-    buf.writeByte(0);   // Code for "this has no code".         // 1
-    buf.writeByte((byte) REGEXSTRINGCOMPARATOR.length);         // 1
-    buf.writeBytes(REGEXSTRINGCOMPARATOR);                      // 52
-    // writeUTF the regexp
-    buf.writeShort(regex.length);                               // 2
-    buf.writeBytes(regex);                                      // regex.length
-    // writeUTF the charset
-    buf.writeShort(chars.length);                               // 2
-    buf.writeBytes(chars);                                      // chars.length
+  /**
+   * Sets a FilterList based on the passed on the byte representation of filter array.
+   * BE CAREFUL: the byte arrays are not representing row key, column family, column qualifier or column value
+   * You can get byte array representation by calling {@link #getColumnPrefix(byte[])},
+   * {@link #getPrefix(byte[])} or add your own.
+   * Enable your logging to DEBUG to see what this function does.
+   * MUST_PASS_ALL (i.e. AND) is the only operator that is supported right now.
+   * @param filters the list of filters that need to be applied to this scan.
+   */
+  public void setFilterList(final byte[]... filters) {
+
+    int totalByteListLength = 0;
+    for(byte[] f : filters) {
+      //we need this extra byte to avoid NullPointerException when readObject() is invoked
+      //we will use the WritableByteArrayComparable used in setKeyRegexp
+      //though I believe that byte value is wrong, since we use 53 while HbaseObjectWritable says its 54
+      totalByteListLength += 1;
+      //we need this extra byte since we will be using the NOT_ENCODED for doing Class.forName in HBASE code
+      //see org.apache.hadoop.hbase.io.HbaseObjectWritable.java
+      totalByteListLength += 1;
+      totalByteListLength += f.length;
+    }
+
+    LOG.debug("setFilterList: creating filter array of size " + (1 + FILTERLIST.length + 1 + 4 + totalByteListLength));
+    filter = new byte[1 + FILTERLIST.length + 1 + 4 + totalByteListLength];
+    final ChannelBuffer buf = ChannelBuffers.wrappedBuffer(filter);
+    buf.clear();
+    totalByteListLength = 0;
+
+    buf.writeByte((byte)FILTERLIST.length);   //1
+    totalByteListLength += 1;
+    buf.writeBytes(FILTERLIST);               //41
+    totalByteListLength += FILTERLIST.length;
+    //MUST_PASS_ALL TODO (vbajaria): allow for MUST_PASS_ONE
+    buf.writeByte((byte)0);                   //1
+    totalByteListLength += 1;
+    //number of filters in list
+    LOG.debug("filters length : " + filters.length);
+    buf.writeInt(filters.length);            //4
+    totalByteListLength += 4;
+    //append all filters
+    for(byte[] f : filters) {
+      LOG.debug("setFilterList: writing filter of length " + f.length);
+      totalByteListLength += 1;
+      buf.writeByte(53);                    //1 : code for WritableByteArrayComparable (NOT!!)
+      totalByteListLength += 1;
+      buf.writeByte(0);                     //1 : code for NOT_ENCODED
+      totalByteListLength += f.length;
+      buf.writeBytes(f);
+    }
+
+    LOG.debug("setFilterList: wrote ChannelBuffer bytes : " + totalByteListLength);
+    LOG.debug("buf length : " + buf.toByteBuffer());
   }
 
   /**
